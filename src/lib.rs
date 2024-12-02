@@ -34,6 +34,7 @@
 // for more info see: <https://github.com/EmbarkStudios/rust-ecosystem/issues/59>
 #![deny(unsafe_code)]
 #![warn(
+    unexpected_cfgs,
     clippy::all,
     clippy::await_holding_lock,
     clippy::char_lit_as_u8,
@@ -74,7 +75,6 @@
     clippy::match_wild_err_arm,
     clippy::match_wildcard_for_single_variants,
     clippy::mem_forget,
-    clippy::mismatched_target_os,
     clippy::missing_enforced_import_renames,
     clippy::mut_mut,
     clippy::mutex_integer,

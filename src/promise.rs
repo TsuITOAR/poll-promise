@@ -58,7 +58,7 @@ pub enum TaskType {
 /// If you enable the `tokio` feature you can use `poll-promise` with the [tokio](https://github.com/tokio-rs/tokio)
 /// runtime to run `async` tasks using [`Promise::spawn_async`], [`Promise::spawn_local`], and [`Promise::spawn_blocking`].
 #[must_use]
-pub struct Promise<T: Send + 'static> {
+pub struct Promise<T: 'static> {
     data: PromiseImpl<T>,
     task_type: TaskType,
 
@@ -91,7 +91,7 @@ compile_error!(
 static_assertions::assert_not_impl_all!(Promise<u32>: Sync);
 static_assertions::assert_impl_all!(Promise<u32>: Send);
 
-impl<T: Send + 'static> Promise<T> {
+impl<T: 'static> Promise<T> {
     /// Create a [`Promise`] and a corresponding [`Sender`].
     ///
     /// Put the promised value into the sender when it is ready.
@@ -138,6 +138,70 @@ impl<T: Send + 'static> Promise<T> {
         }
     }
 
+    /// Returns either a reference to the ready value [`std::task::Poll::Ready`]
+    /// or [`std::task::Poll::Pending`].
+    ///
+    /// Panics if the connected [`Sender`] was dropped before a value was sent.
+    pub fn poll(&self) -> std::task::Poll<&T> {
+        self.data.poll(self.task_type)
+    }
+
+    /// Returns either a mut reference to the ready value in a [`std::task::Poll::Ready`]
+    /// or a [`std::task::Poll::Pending`].
+    ///
+    /// Panics if the connected [`Sender`] was dropped before a value was sent.
+    pub fn poll_mut(&mut self) -> std::task::Poll<&mut T> {
+        self.data.poll_mut(self.task_type)
+    }
+
+    /// Returns the type of task this promise is running.
+    /// See [`TaskType`].
+    pub fn task_type(&self) -> TaskType {
+        self.task_type
+    }
+
+    /// Polls the promise and either returns a reference to the data, or [`None`] if still pending.
+    ///
+    /// Panics if the connected [`Sender`] was dropped before a value was sent.
+    pub fn ready(&self) -> Option<&T> {
+        match self.poll() {
+            std::task::Poll::Pending => None,
+            std::task::Poll::Ready(value) => Some(value),
+        }
+    }
+
+    /// Polls the promise and either returns a mutable reference to the data, or [`None`] if still pending.
+    ///
+    /// Panics if the connected [`Sender`] was dropped before a value was sent.
+    pub fn ready_mut(&mut self) -> Option<&mut T> {
+        match self.poll_mut() {
+            std::task::Poll::Pending => None,
+            std::task::Poll::Ready(value) => Some(value),
+        }
+    }
+
+    /// Returns either the completed promise object or the promise itself if it is not completed yet.
+    ///
+    /// Panics if the connected [`Sender`] was dropped before a value was sent.
+    pub fn try_take(self) -> Result<T, Self> {
+        self.data.try_take().map_err(|data| Self {
+            data,
+            task_type: self.task_type,
+
+            #[cfg(feature = "tokio")]
+            join_handle: None,
+
+            #[cfg(feature = "async-std")]
+            async_std_join_handle: None,
+
+            #[cfg(feature = "smol")]
+            smol_task: self.smol_task,
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + 'static> Promise<T> {
     /// Spawn a future. Runs the task concurrently.
     ///
     /// See [`Self::spawn_local`].
@@ -188,52 +252,6 @@ impl<T: Send + 'static> Promise<T> {
                 Some(async_std::task::spawn(
                     async move { sender.send(future.await) },
                 ));
-        }
-
-        promise
-    }
-
-    /// Spawn a future. Runs it in the local thread.
-    ///
-    /// You need to compile `poll-promise` with either the "tokio", "smol", or "web" feature for this to be available.
-    ///
-    /// This is a convenience method, using [`Self::new`] with [`tokio::task::spawn_local`].
-    /// Unlike [`Self::spawn_async`] this method does not require [`Send`].
-    /// However, you will have to set up [`tokio::task::LocalSet`]s yourself.
-    ///
-    /// ## Example
-    /// ``` no_run
-    /// # async fn something_async() {}
-    /// # use poll_promise::Promise;
-    /// let promise = Promise::spawn_local(async move { something_async().await });
-    /// ```
-    #[cfg(any(feature = "tokio", feature = "web", feature = "smol"))]
-    pub fn spawn_local(future: impl std::future::Future<Output = T> + 'static) -> Self {
-        // When using the web feature we don't mutate promise.
-        #[allow(unused_mut)]
-        let (sender, mut promise) = Self::new();
-        promise.task_type = TaskType::Local;
-
-        // This *generally* works but not super well.
-        // Tokio doesn't do any fancy local scheduling.
-        #[cfg(feature = "tokio")]
-        {
-            promise.join_handle = Some(tokio::task::spawn_local(async move {
-                sender.send(future.await);
-            }));
-        }
-
-        #[cfg(feature = "web")]
-        {
-            wasm_bindgen_futures::spawn_local(async move { sender.send(future.await) });
-        }
-
-        #[cfg(feature = "smol")]
-        {
-            promise.smol_task = Some(
-                crate::LOCAL_EXECUTOR
-                    .with(|exec| exec.spawn(async move { sender.send(future.await) })),
-            );
         }
 
         promise
@@ -305,45 +323,6 @@ impl<T: Send + 'static> Promise<T> {
         promise
     }
 
-    /// Polls the promise and either returns a reference to the data, or [`None`] if still pending.
-    ///
-    /// Panics if the connected [`Sender`] was dropped before a value was sent.
-    pub fn ready(&self) -> Option<&T> {
-        match self.poll() {
-            std::task::Poll::Pending => None,
-            std::task::Poll::Ready(value) => Some(value),
-        }
-    }
-
-    /// Polls the promise and either returns a mutable reference to the data, or [`None`] if still pending.
-    ///
-    /// Panics if the connected [`Sender`] was dropped before a value was sent.
-    pub fn ready_mut(&mut self) -> Option<&mut T> {
-        match self.poll_mut() {
-            std::task::Poll::Pending => None,
-            std::task::Poll::Ready(value) => Some(value),
-        }
-    }
-
-    /// Returns either the completed promise object or the promise itself if it is not completed yet.
-    ///
-    /// Panics if the connected [`Sender`] was dropped before a value was sent.
-    pub fn try_take(self) -> Result<T, Self> {
-        self.data.try_take().map_err(|data| Self {
-            data,
-            task_type: self.task_type,
-
-            #[cfg(feature = "tokio")]
-            join_handle: None,
-
-            #[cfg(feature = "async-std")]
-            async_std_join_handle: None,
-
-            #[cfg(feature = "smol")]
-            smol_task: self.smol_task,
-        })
-    }
-
     /// Block execution until ready, then returns a reference to the value.
     ///
     /// Panics if the connected [`Sender`] was dropped before a value was sent.
@@ -372,28 +351,6 @@ impl<T: Send + 'static> Promise<T> {
         }
     }
 
-    /// Returns either a reference to the ready value [`std::task::Poll::Ready`]
-    /// or [`std::task::Poll::Pending`].
-    ///
-    /// Panics if the connected [`Sender`] was dropped before a value was sent.
-    pub fn poll(&self) -> std::task::Poll<&T> {
-        self.data.poll(self.task_type)
-    }
-
-    /// Returns either a mut reference to the ready value in a [`std::task::Poll::Ready`]
-    /// or a [`std::task::Poll::Pending`].
-    ///
-    /// Panics if the connected [`Sender`] was dropped before a value was sent.
-    pub fn poll_mut(&mut self) -> std::task::Poll<&mut T> {
-        self.data.poll_mut(self.task_type)
-    }
-
-    /// Returns the type of task this promise is running.
-    /// See [`TaskType`].
-    pub fn task_type(&self) -> TaskType {
-        self.task_type
-    }
-
     /// Abort the running task spawned by [`Self::spawn_async`].
     #[cfg(feature = "tokio")]
     pub fn abort(self) {
@@ -403,16 +360,64 @@ impl<T: Send + 'static> Promise<T> {
     }
 }
 
+impl<T: 'static> Promise<T> {
+    /// Spawn a future. Runs it in the local thread.
+    ///
+    /// You need to compile `poll-promise` with either the "tokio", "smol", or "web" feature for this to be available.
+    ///
+    /// This is a convenience method, using [`Self::new`] with [`tokio::task::spawn_local`].
+    /// Unlike [`Self::spawn_async`] this method does not require [`Send`].
+    /// However, you will have to set up [`tokio::task::LocalSet`]s yourself.
+    ///
+    /// ## Example
+    /// ``` no_run
+    /// # async fn something_async() {}
+    /// # use poll_promise::Promise;
+    /// let promise = Promise::spawn_local(async move { something_async().await });
+    /// ```
+    #[cfg(any(feature = "tokio", feature = "web", feature = "smol"))]
+    pub fn spawn_local(future: impl std::future::Future<Output = T> + 'static) -> Self {
+        // When using the web feature we don't mutate promise.
+        #[allow(unused_mut)]
+        let (sender, mut promise) = Self::new();
+        promise.task_type = TaskType::Local;
+
+        // This *generally* works but not super well.
+        // Tokio doesn't do any fancy local scheduling.
+        #[cfg(feature = "tokio")]
+        {
+            promise.join_handle = Some(tokio::task::spawn_local(async move {
+                sender.send(future.await);
+            }));
+        }
+
+        #[cfg(feature = "web")]
+        {
+            wasm_bindgen_futures::spawn_local(async move { sender.send(future.await) });
+        }
+
+        #[cfg(feature = "smol")]
+        {
+            promise.smol_task = Some(
+                crate::LOCAL_EXECUTOR
+                    .with(|exec| exec.spawn(async move { sender.send(future.await) })),
+            );
+        }
+
+        promise
+    }
+}
+
 // ----------------------------------------------------------------------------
 
-enum PromiseStatus<T: Send + 'static> {
+enum PromiseStatus<T: 'static> {
     Pending(std::sync::mpsc::Receiver<T>),
     Ready(T),
 }
 
-struct PromiseImpl<T: Send + 'static>(UnsafeCell<PromiseStatus<T>>);
+struct PromiseImpl<T: 'static>(UnsafeCell<PromiseStatus<T>>);
 
-impl<T: Send + 'static> PromiseImpl<T> {
+impl<T: 'static> PromiseImpl<T> {
     #[allow(unused_variables)]
     fn poll_mut(&mut self, task_type: TaskType) -> std::task::Poll<&mut T> {
         let inner = self.0.get_mut();
